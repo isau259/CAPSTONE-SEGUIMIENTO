@@ -1,0 +1,19 @@
+{
+  "segment_id": "sub-001_ses-01_task-szMonitoring_run-07_seg-00",
+  "subject": "001",
+  "session": "01",
+  "task": "szMonitoring",
+  "run": "07",
+  "source_ecg": "/Users/isaurac/Desktop/Capstone/DATOS/01-openneuro/sub-001/ses-01/ecg/sub-001_ses-01_task-szMonitoring_run-07_ecg.edf",
+  "source_events": "/Users/isaurac/Desktop/Capstone/DATOS/01-openneuro/sub-001/ses-01/eeg/sub-001_ses-01_task-szMonitoring_run-07_events.tsv",
+  "event_index": 0,
+  "event_type": "sz_foc_ia_m_tonic",
+  "onset_sec": 16300.0,
+  "duration_sec": 143.0,
+  "cut_start_sec": 15400.0,
+  "cut_end_sec": 17343.0,
+  "pre_sec": 900.0,
+  "post_sec": 900.0,
+  "n_samples": 497408,
+  "fs_hz": 256.0
+}
