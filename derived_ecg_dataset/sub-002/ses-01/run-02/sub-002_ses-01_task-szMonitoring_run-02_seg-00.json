@@ -1,0 +1,19 @@
+{
+  "segment_id": "sub-002_ses-01_task-szMonitoring_run-02_seg-00",
+  "subject": "002",
+  "session": "01",
+  "task": "szMonitoring",
+  "run": "02",
+  "source_ecg": "../01-openneuro/sub-002/ses-01/ecg/sub-002_ses-01_task-szMonitoring_run-02_ecg.edf",
+  "source_events": "../01-openneuro/sub-002/ses-01/eeg/sub-002_ses-01_task-szMonitoring_run-02_events.tsv",
+  "event_index": 0,
+  "event_type": "sz_foc_a_m_hyperkinetic",
+  "onset_sec": 5224.0,
+  "duration_sec": 112.0,
+  "cut_start_sec": 4324.0,
+  "cut_end_sec": 6236.0,
+  "pre_sec": 900.0,
+  "post_sec": 900.0,
+  "n_samples": 489472,
+  "fs_hz": 256.0
+}
