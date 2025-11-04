@@ -1,0 +1,19 @@
+{
+  "segment_id": "sub-019_ses-01_task-szMonitoring_run-07_seg-00",
+  "subject": "019",
+  "session": "01",
+  "task": "szMonitoring",
+  "run": "07",
+  "source_ecg": "../01-openneuro/sub-019/ses-01/ecg/sub-019_ses-01_task-szMonitoring_run-07_ecg.edf",
+  "source_events": "../01-openneuro/sub-019/ses-01/eeg/sub-019_ses-01_task-szMonitoring_run-07_events.tsv",
+  "event_index": 0,
+  "event_type": "sz_foc_f2b",
+  "onset_sec": 33765.0,
+  "duration_sec": 154.0,
+  "cut_start_sec": 32865.0,
+  "cut_end_sec": 34819.0,
+  "pre_sec": 900.0,
+  "post_sec": 900.0,
+  "n_samples": 500224,
+  "fs_hz": 256.0
+}
