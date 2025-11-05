@@ -265,7 +265,7 @@ def viewer_plotly_params_from_df(
     events=None,
     metrics=("HR_mean","SDNN_ms","RMSSD_ms","HF","RR_entropy"),
     smooth_options=(1,3,5,9),
-    default_metric="HF",
+    default_metric="ALERTA_PERSISTENTE",
     default_smooth=5,
     open_in_browser=False
 ):
@@ -288,10 +288,10 @@ def viewer_plotly_params_from_df(
         RAW_KEY = "ECG_raw"
         metrics_all.append(RAW_KEY)
 
-    if default_metric not in metrics_all:
-        default_metric = RAW_KEY if RAW_KEY is not None else metrics_all[0]
     if default_smooth not in smooth_options:
         default_smooth = smooth_options[0]
+    if default_metric not in metrics_all:
+        default_metric = metrics_all[0]
 
     # Eje X para métricas por ventana
     x_win = df["start_s"].values if "start_s" in df.columns else np.arange(len(df))
@@ -311,6 +311,13 @@ def viewer_plotly_params_from_df(
         y_raw = np.asarray(y_raw, dtype=float)
         for N in smooth_options:
             data[(RAW_KEY, N)] = (t_raw, y_raw, _smooth_series(y_raw, N))
+
+    sub  = df.attrs.get("sub", "???")
+    ses  = df.attrs.get("ses", "??")
+    run  = df.attrs.get("run", "??")
+    seg  = df.attrs.get("seg", "??")
+
+    base_title = f"Crisis | Sub {sub} Ses {ses} Run {run} Seg {seg}"
 
     # Construcción de figura
     fig = go.Figure()
@@ -351,22 +358,25 @@ def viewer_plotly_params_from_df(
                                    xref="x", yref="paper", line=dict(color="orange", dash="dash")))
 
     fig.update_layout(
-        title=f"{default_metric}",
+        title=dict(
+            text=f"{base_title}",
+            x=0.5, xanchor="center",
+        ),
+        margin=dict(t=200),  # deja espacio para los menús y el título
         xaxis_title="Tiempo (s)",
         yaxis_title=f"{default_metric}",
         shapes=shapes,
         xaxis=dict(
             rangeselector=dict(buttons=[
-                dict(count=60, label="1m", step="second", stepmode="backward"),
+                dict(count=60,  label="1m", step="second", stepmode="backward"),
                 dict(count=300, label="5m", step="second", stepmode="backward"),
                 dict(step="all")
             ]),
             rangeslider=dict(visible=True),
             type="linear"
         ),
-        legend=dict(orientation="h")
+        legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5)
     )
-
     # Dropdowns
     # 1) Métrica
     metric_buttons = []
@@ -379,8 +389,16 @@ def viewer_plotly_params_from_df(
         metric_buttons.append(dict(
             label=m,
             method="update",
-            args=[{"visible": vis_array},
-                  {"title": m, "yaxis": {"title": m}}]
+            args=[
+                {"visible": vis_array},
+                {
+                    "title": {
+                        "text": f"{base_title}",
+                        "x": 0.5, "xanchor": "center"
+                    },
+                    "yaxis": {"title": m}
+                }
+            ]
         ))
     # 2) Smooth N
     smooth_buttons = []
@@ -392,8 +410,15 @@ def viewer_plotly_params_from_df(
         smooth_buttons.append(dict(
             label=f"N={N}",
             method="update",
-            args=[{"visible": vis_array},
-                  {"title": f"{default_metric}", "yaxis": {"title": f"{default_metric}"}}]
+            args=[
+                {"visible": vis_array},
+                {
+                    "title": {
+                        "text": f"{base_title}",
+                        "x": 0.5, "xanchor": "center"
+                    }
+                }
+            ]
         ))
 
     fig.update_layout(
@@ -417,7 +442,7 @@ def viewer_plotly_params_from_df(
 import pandas as pd
 import numpy as np
 
-def calcular_baseline_y_alertas(df, baseline_duration_sec=1800, persistence_sec=60):
+def calcular_baseline_y_alertas(df, baseline_duration_sec=1800, persistence_sec=60, min_votes=4):
     """
     Calcula la línea de base, aplica los 6 criterios de alerta y filtra por:
     1. Criterio de Consenso (3 o más alertas individuales activas).
@@ -500,7 +525,7 @@ def calcular_baseline_y_alertas(df, baseline_duration_sec=1800, persistence_sec=
     df['Contador_Alertas'] = df[individual_alerts].sum(axis=1)
     
     # La alerta de consenso se activa si 3 o más predictores están activos
-    MIN_VOTES = 4
+    MIN_VOTES = min_votes
     df['ALERTA_CONSENSO'] = (df['Contador_Alertas'] >= MIN_VOTES)
 
 
