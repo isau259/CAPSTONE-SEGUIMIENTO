@@ -3,6 +3,7 @@ import pandas as pd
 import mne, neurokit2 as nk
 from scipy.stats import skew, kurtosis
 import json
+from scipy import stats
 
 def listar_funciones(n_col=1):
     import inspect, math, sys, os
@@ -39,7 +40,7 @@ def crear_variable(sub, ses, run, seg):
     return npz, json, (sub,ses,run,seg)
 
 # Se eliminan 'matplotlib.pyplot as plt', 'entropy' e 'iqr' si solo se usaban en funciones auxiliares obsoletas.
-def procesamiento(datos, win_size=60, step=15, smooth_n=5, overview_ds=10):
+'''def procesamiento(datos, win_size=60, step=15, smooth_n=5, overview_ds=10):
     # =======================
     # Parámetros
     # =======================
@@ -238,6 +239,426 @@ def procesamiento(datos, win_size=60, step=15, smooth_n=5, overview_ds=10):
     df.attrs["sub"] = datos[2][0]    # ej: "001"
     df.attrs["ses"] = datos[2][1]    # ej: "01"
     df.attrs["run"] = datos[2][2]    # ej: "03"
+    df.attrs["seg"] = datos[2][3] 
+
+    return df'''
+
+'''def procesamiento(datos, win_size=60, step=15, smooth_n=5, overview_ds=10):
+    # =======================
+    # Parámetros
+    # =======================
+    WIN_SIZE = int(win_size)
+    STEP = int(step)
+    SMOOTH_N = int(smooth_n)
+    DOWNSAMPLE_OVERVIEW = int(overview_ds)
+    
+    npz_path, json_path, info = datos
+
+    # ... (Cargar metadata JSON y ECG desde NPZ se mantiene igual) ...
+    # ... (Carga de fs, onset_abs, t_abs, x_ds, t_ds, etc.) ...
+    
+    with open(json_path, "r") as f:
+        meta = json.load(f)
+    fs = float(meta["fs_hz"])
+    onset_abs = float(meta.get("onset_sec", 0.0) or 0.0) 
+    offset_abs = onset_abs + float(meta.get("duration_sec", 0.0) or 0.0)
+    t_cut0 = float(meta.get("cut_start_sec", 0.0))
+
+    npz = np.load(npz_path)
+    ecg = None
+    for k in npz.files:
+        arr = np.asarray(npz[k])
+        if arr.ndim == 1 and arr.size > 100:
+            ecg = arr.astype(float)
+            break
+    if ecg is None:
+        raise RuntimeError(f"No encontré señal 1D en {npz_path}. Claves: {npz.files}")
+
+    t = None
+    for k in npz.files:
+        if k.lower() in ("t", "time", "times"):
+            t = np.asarray(npz[k], dtype=float)
+            break
+    if t is None:
+        t_abs = np.arange(len(ecg))/fs + t_cut0
+    else:
+        t_abs = t + t_cut0
+
+    dur_total = len(ecg) / fs
+    print(f"fs={fs:.1f} Hz | duración={dur_total:.1f} s | muestras={len(ecg):,}")
+    print(f"onset={onset_abs:.2f}s | offset={offset_abs:.2f}s | cut_start={t_cut0:.2f}s")
+
+    _step = max(DOWNSAMPLE_OVERVIEW, 1)
+    x_ds = ecg[::_step]
+    t_ds = (t_abs if len(t_abs)==len(ecg) else (np.arange(len(ecg))/fs + t_cut0))[::_step]
+    
+    # =======================
+    # Ventanas deslizantes
+    # =======================
+    def make_segments(signal, fs, win_s=30, step_s=15):
+        dur = len(signal) / fs
+        segments = []
+        starts = np.arange(0, max(dur - win_s, 0) + 1e-9, step_s)
+        for start in starts:
+            s = int(start * fs); e = int((start + win_s) * fs)
+            if e <= len(signal):
+                segments.append((start, start + win_s, signal[s:e]))
+        return segments
+
+    segments = make_segments(ecg, fs, WIN_SIZE, STEP)
+    print(f"Total de ventanas: {len(segments)} (win={WIN_SIZE}s, step={STEP}s)")
+
+    # =======================
+    # Extraer features por ventana
+    # =======================
+    rows = []
+    for (start, end, segment) in segments:
+        ecg_clean = nk.ecg_clean(segment, sampling_rate=fs)
+        signals, info = nk.ecg_peaks(ecg_clean, sampling_rate=fs)
+        rpeaks = info.get("ECG_R_Peaks", None)
+
+        # --- CAMBIO CLAVE 1: Filtro de calidad para 50 intervalos R-R (51 picos) ---
+        if rpeaks is None or len(rpeaks) < 51:
+            rows.append({
+                "start_s": start + t_cut0, "end_s": end + t_cut0,
+                "HR_mean": np.nan, "SDNN_ms": np.nan, "RMSSD_ms": np.nan,
+                "HF": np.nan, "SampEn": np.nan, 
+                "n_beats": 0 if rpeaks is None else len(rpeaks),
+                "LF": np.nan, "LF/HF": np.nan, "pLF": np.nan, "pHF": np.nan,
+                # --- Añadir NaN para nuevas métricas ---
+                "CSI": np.nan, "ModCSI": np.nan, "Tachogram_Slope": np.nan,
+                "median_rr": np.nan, "mode_rr": np.nan, "geom_mean_rr": np.nan, "harm_mean_rr": np.nan,
+                "std_dev_rr": np.nan, "variance_rr": np.nan, "abs_dev_rr": np.nan, "iqr_rr": np.nan,
+                "p25_rr": np.nan, "p75_rr": np.nan, "kurtosis_rr": np.nan, "skewness_rr": np.nan
+            })
+            continue
+        # --- FIN DEL CAMBIO ---
+
+        hr_sig = nk.ecg_rate(rpeaks, sampling_rate=fs, desired_length=len(segment))
+        hr_mean = float(np.nanmean(hr_sig))
+
+        hrv_t = nk.hrv_time(rpeaks, sampling_rate=fs, show=False)
+        SDNN = float(hrv_t.get("HRV_SDNN", pd.Series([np.nan])).iloc[0])
+        RMSSD = float(hrv_t.get("HRV_RMSSD", pd.Series([np.nan])).iloc[0])
+
+        rr_samples = np.diff(rpeaks)
+        rr_ms = rr_samples / fs * 1000.0
+        rr_ms = rr_ms[np.isfinite(rr_ms)] 
+
+        # --- NUEVO CÁLCULO: Pendiente (Slope) del Tacograma ---
+        Tachogram_Slope = np.nan
+        if len(rr_ms) > 1:
+            # Crear un eje 'x' simple (índice del latido)
+            x_axis = np.arange(len(rr_ms))
+            try:
+                # Calcular regresión lineal (mínimos cuadrados)
+                lin_reg = stats.linregress(x_axis, rr_ms)
+                Tachogram_Slope = abs(lin_reg.slope)
+            except Exception:
+                Tachogram_Slope = np.nan
+        # --- FIN NUEVO CÁLCULO ---
+
+        if len(rr_ms) > 0:
+            median_rr = np.median(rr_ms)
+            mode_result = pd.Series(rr_ms).mode()
+            mode_rr = float(mode_result.iloc[0]) if not mode_result.empty else np.nan
+            geom_mean_rr = np.exp(np.mean(np.log(rr_ms))) if np.all(rr_ms > 0) else np.nan
+            harm_mean_rr = len(rr_ms) / np.sum(1.0/rr_ms) if np.all(rr_ms > 0) else np.nan
+            std_dev_rr = np.std(rr_ms)
+            variance_rr = np.var(rr_ms)
+            abs_dev_rr = np.mean(np.abs(rr_ms - np.mean(rr_ms)))
+            p25_rr = np.percentile(rr_ms, 25)
+            p75_rr = np.percentile(rr_ms, 75)
+            iqr_rr = p75_rr - p75_rr
+            kurtosis_rr = float(kurtosis(rr_ms))
+            skewness_rr = float(skew(rr_ms))
+        else:
+            median_rr, mode_rr, geom_mean_rr, harm_mean_rr = np.nan, np.nan, np.nan, np.nan
+            std_dev_rr, variance_rr, abs_dev_rr, iqr_rr = np.nan, np.nan, np.nan, np.nan
+            p25_rr, p75_rr, kurtosis_rr, skewness_rr = np.nan, np.nan, np.nan, np.nan
+
+        try:
+            hrv_f = nk.hrv_frequency(rpeaks, sampling_rate=fs, show=False, psd_method="welch", interpolation_rate=4)
+        except Exception:
+            try:
+                hrv_f = nk.hrv_frequency(rpeaks, sampling_rate=fs, show=False, psd_method="lomb", interpolation_rate=4)
+            except Exception:
+                hrv_f = None
+        
+        if (hrv_f is not None and not hrv_f.empty):
+            HF = float(hrv_f.get("HRV_HF", pd.Series([np.nan])).iloc[0])
+            LF = float(hrv_f.get("HRV_LF", pd.Series([np.nan])).iloc[0])
+            LFHF = float(hrv_f.get("HRV_LFHF", pd.Series([np.nan])).iloc[0])
+            pLF = float(hrv_f.get("HRV_LFn", pd.Series([np.nan])).iloc[0] * 100.0)
+            pHF = float(hrv_f.get("HRV_HFn", pd.Series([np.nan])).iloc[0] * 100.0)
+        else:
+            HF, LF, LFHF, pLF, pHF = np.nan, np.nan, np.nan, np.nan, np.nan
+
+        # --- MODIFICACIÓN CÁLCULO: HRV No Lineal (para CSI/ModCSI) ---
+        SampEn = np.nan
+        CSI = np.nan
+        ModCSI = np.nan
+        try:
+            hrv_nonlin = nk.hrv_nonlinear(rpeaks, sampling_rate=fs, show=False)
+            SampEn = float(hrv_nonlin.get("HRV_SampEn", pd.Series([np.nan])).iloc[0])
+            # Extraer nuevos valores
+            CSI = float(hrv_nonlin.get("HRV_CSI", pd.Series([np.nan])).iloc[0])
+            ModCSI = float(hrv_nonlin.get("HRV_ModCSI", pd.Series([np.nan])).iloc[0])
+        except Exception:
+            # Si falla, se quedan como np.nan
+            pass
+        # --- FIN MODIFICACIÓN ---
+            
+        rows.append({
+            "start_s": start + t_cut0, "end_s": end + t_cut0,
+            "HR_mean": hr_mean, "SDNN_ms": SDNN, "RMSSD_ms": RMSSD,
+            "HF": HF, "SampEn": SampEn, "n_beats": int(len(rpeaks)),
+            "LF": LF, "LF/HF": LFHF, "pLF": pLF, "pHF": pHF,
+            
+            # --- NUEVAS MÉTRICAS AÑADIDAS ---
+            "CSI": CSI,
+            "ModCSI": ModCSI,
+            "Tachogram_Slope": Tachogram_Slope,
+            
+            "median_rr": median_rr, "mode_rr": mode_rr, "geom_mean_rr": geom_mean_rr, "harm_mean_rr": harm_mean_rr,
+            "std_dev_rr": std_dev_rr, "variance_rr": variance_rr, "abs_dev_rr": abs_dev_rr, "iqr_rr": iqr_rr,
+            "p25_rr": p25_rr, "p75_rr": p75_rr, "kurtosis_rr": kurtosis_rr, "skewness_rr": skewness_rr
+        })
+
+    df = pd.DataFrame(rows).sort_values("start_s").reset_index(drop=True)
+
+    df["RAW_t"]= pd.Series([None]*len(df), dtype=object)
+    df["RAW_ecg"] = pd.Series([None]*len(df), dtype=object)
+
+    if len(df) > 0:
+        df.at[0, "RAW_t"]= t_ds
+        df.at[0, "RAW_ecg"] = x_ds
+    
+    df.attrs["onset_abs"]  = onset_abs
+    df.attrs["offset_abs"] = offset_abs
+    df.attrs["fs"]         = fs
+    df.attrs["npz_path"]   = npz_path
+    df.attrs["json_path"]  = json_path
+    df.attrs["sub"] = datos[2][0]
+    df.attrs["ses"] = datos[2][1]
+    df.attrs["run"] = datos[2][2]
+    df.attrs["seg"] = datos[2][3] 
+
+    return df'''
+
+def procesamiento(datos, win_size=60, step=15, smooth_n=5, overview_ds=10):
+    
+    # --- Flags de depuración eliminados ---
+
+    # =======================
+    # Parámetros
+    # =======================
+    WIN_SIZE = int(win_size)
+    STEP = int(step)
+    SMOOTH_N = int(smooth_n)
+    DOWNSAMPLE_OVERVIEW = int(overview_ds)
+    
+    npz_path, json_path, info = datos
+
+    # =======================
+    # Cargar metadata (JSON)
+    # =======================
+    with open(json_path, "r") as f:
+        meta = json.load(f)
+    fs = float(meta["fs_hz"])
+    onset_abs = float(meta.get("onset_sec", 0.0) or 0.0) 
+    offset_abs = onset_abs + float(meta.get("duration_sec", 0.0) or 0.0)
+    t_cut0 = float(meta.get("cut_start_sec", 0.0))
+
+    npz = np.load(npz_path)
+    ecg = None
+    for k in npz.files:
+        arr = np.asarray(npz[k])
+        if arr.ndim == 1 and arr.size > 100:
+            ecg = arr.astype(float)
+            break
+    if ecg is None:
+        raise RuntimeError(f"No encontré señal 1D en {npz_path}. Claves: {npz.files}")
+
+    t = None
+    for k in npz.files:
+        if k.lower() in ("t", "time", "times"):
+            t = np.asarray(npz[k], dtype=float)
+            break
+    if t is None:
+        t_abs = np.arange(len(ecg))/fs + t_cut0
+    else:
+        t_abs = t + t_cut0
+
+    dur_total = len(ecg) / fs
+    print(f"fs={fs:.1f} Hz | duración={dur_total:.1f} s | muestras={len(ecg):,}")
+    print(f"onset={onset_abs:.2f}s | offset={offset_abs:.2f}s | cut_start={t_cut0:.2f}s")
+
+    _step = max(DOWNSAMPLE_OVERVIEW, 1)
+    x_ds = ecg[::_step]
+    t_ds = (t_abs if len(t_abs)==len(ecg) else (np.arange(len(ecg))/fs + t_cut0))[::_step]
+    
+    def make_segments(signal, fs, win_s=30, step_s=15):
+        dur = len(signal) / fs
+        segments = []
+        starts = np.arange(0, max(dur - win_s, 0) + 1e-9, step_s)
+        for start in starts:
+            s = int(start * fs); e = int((start + win_s) * fs)
+            if e <= len(signal):
+                segments.append((start, start + win_s, signal[s:e]))
+        return segments
+
+    segments = make_segments(ecg, fs, WIN_SIZE, STEP)
+    print(f"Total de ventanas: {len(segments)} (win={WIN_SIZE}s, step={STEP}s)")
+
+    rows = []
+    for (start, end, segment) in segments:
+        ecg_clean = nk.ecg_clean(segment, sampling_rate=fs)
+        signals, info = nk.ecg_peaks(ecg_clean, sampling_rate=fs)
+        rpeaks = info.get("ECG_R_Peaks", None)
+
+        # Filtro de calidad (101 picos)
+        if rpeaks is None or len(rpeaks) < 101: 
+            # --- Eliminado el print de DEBUG ---
+            rows.append({
+                "start_s": start + t_cut0, "end_s": end + t_cut0,
+                "HR_mean": np.nan, "SDNN_ms": np.nan, "RMSSD_ms": np.nan,
+                "HF": np.nan, "SampEn": np.nan, "n_beats": 0 if rpeaks is None else len(rpeaks),
+                "LF": np.nan, "LF/HF": np.nan, "pLF": np.nan, "pHF": np.nan,
+                "CSI": np.nan, "ModCSI": np.nan, "Tachogram_Slope": np.nan,
+                "median_rr": np.nan, "mode_rr": np.nan, "geom_mean_rr": np.nan, "harm_mean_rr": np.nan,
+                "std_dev_rr": np.nan, "variance_rr": np.nan, "abs_dev_rr": np.nan, "iqr_rr": np.nan,
+                "p25_rr": np.nan, "p75_rr": np.nan, "kurtosis_rr": np.nan, "skewness_rr": np.nan
+            })
+            continue
+
+        # ... (cálculo de hr_mean, hrv_t, rr_ms, Tachogram_Slope, stats_rr, hrv_f se mantiene igual) ...
+        hr_sig = nk.ecg_rate(rpeaks, sampling_rate=fs, desired_length=len(segment))
+        hr_mean = float(np.nanmean(hr_sig))
+
+        hrv_t = nk.hrv_time(rpeaks, sampling_rate=fs, show=False)
+        SDNN = float(hrv_t.get("HRV_SDNN", pd.Series([np.nan])).iloc[0])
+        RMSSD = float(hrv_t.get("HRV_RMSSD", pd.Series([np.nan])).iloc[0])
+
+        rr_samples = np.diff(rpeaks)
+        rr_ms = rr_samples / fs * 1000.0
+        rr_ms = rr_ms[np.isfinite(rr_ms)] 
+
+        Tachogram_Slope = np.nan
+        if len(rr_ms) > 1:
+            x_axis = np.arange(len(rr_ms))
+            try:
+                lin_reg = stats.linregress(x_axis, rr_ms)
+                Tachogram_Slope = abs(lin_reg.slope)
+            except Exception:
+                Tachogram_Slope = np.nan
+        
+        if len(rr_ms) > 0:
+            median_rr, mode_rr, geom_mean_rr, harm_mean_rr = np.nan, np.nan, np.nan, np.nan
+            std_dev_rr, variance_rr, abs_dev_rr, iqr_rr = np.nan, np.nan, np.nan, np.nan
+            p25_rr, p75_rr, kurtosis_rr, skewness_rr = np.nan, np.nan, np.nan, np.nan
+            
+            try: median_rr = np.median(rr_ms)
+            except: pass
+            try:
+                mode_result = pd.Series(rr_ms).mode()
+                mode_rr = float(mode_result.iloc[0]) if not mode_result.empty else np.nan
+            except: pass
+            try: geom_mean_rr = np.exp(np.mean(np.log(rr_ms))) if np.all(rr_ms > 0) else np.nan
+            except: pass
+            try: harm_mean_rr = len(rr_ms) / np.sum(1.0/rr_ms) if np.all(rr_ms > 0) else np.nan
+            except: pass
+            try: std_dev_rr = np.std(rr_ms)
+            except: pass
+            try: variance_rr = np.var(rr_ms)
+            except: pass
+            try: abs_dev_rr = np.mean(np.abs(rr_ms - np.mean(rr_ms)))
+            except: pass
+            try: p25_rr = np.percentile(rr_ms, 25)
+            except: pass
+            try: p75_rr = np.percentile(rr_ms, 75)
+            except: pass
+            try: iqr_rr = p75_rr - p25_rr
+            except: pass
+            try: kurtosis_rr = float(kurtosis(rr_ms))
+            except: pass
+            try: skewness_rr = float(skew(rr_ms))
+            except: pass
+        else:
+            median_rr, mode_rr, geom_mean_rr, harm_mean_rr = np.nan, np.nan, np.nan, np.nan
+            std_dev_rr, variance_rr, abs_dev_rr, iqr_rr = np.nan, np.nan, np.nan, np.nan
+            p25_rr, p75_rr, kurtosis_rr, skewness_rr = np.nan, np.nan, np.nan, np.nan
+
+        try:
+            hrv_f = nk.hrv_frequency(rpeaks, sampling_rate=fs, show=False, psd_method="welch", interpolation_rate=4)
+        except Exception:
+            try:
+                hrv_f = nk.hrv_frequency(rpeaks, sampling_rate=fs, show=False, psd_method="lomb", interpolation_rate=4)
+            except Exception:
+                hrv_f = None
+        
+        if (hrv_f is not None and not hrv_f.empty):
+            HF = float(hrv_f.get("HRV_HF", pd.Series([np.nan])).iloc[0])
+            LF = float(hrv_f.get("HRV_LF", pd.Series([np.nan])).iloc[0])
+            LFHF = float(hrv_f.get("HRV_LFHF", pd.Series([np.nan])).iloc[0])
+            pLF = float(hrv_f.get("HRV_LFn", pd.Series([np.nan])).iloc[0] * 100.0)
+            pHF = float(hrv_f.get("HRV_HFn", pd.Series([np.nan])).iloc[0] * 100.0)
+        else:
+            HF, LF, LFHF, pLF, pHF = np.nan, np.nan, np.nan, np.nan, np.nan
+
+
+        # --- MODIFICACIÓN CÁLCULO: HRV No Lineal (Limpio) ---
+        SampEn = np.nan
+        CSI = np.nan
+        ModCSI = np.nan  # Se quedará como NaN, lo cual está bien.
+        try:
+            hrv_nonlin = nk.hrv_nonlinear(rpeaks, sampling_rate=fs, show=False)
+            
+            SampEn = float(hrv_nonlin.get("HRV_SampEn", pd.Series([np.nan])).iloc[0])
+            CSI_calc = float(hrv_nonlin.get("HRV_CSI", pd.Series([np.nan])).iloc[0])
+
+            # Asignar CSI solo si no es NaN (comprobación de calidad silenciosa)
+            if not pd.isna(CSI_calc):
+                CSI = CSI_calc
+            
+            # No intentamos calcular ModCSI
+        
+        except Exception as e:
+            # Error silencioso.
+            pass 
+        # --- FIN MODIFICACIÓN ---
+            
+        rows.append({
+            "start_s": start + t_cut0, "end_s": end + t_cut0,
+            "HR_mean": hr_mean, "SDNN_ms": SDNN, "RMSSD_ms": RMSSD,
+            "HF": HF, "SampEn": SampEn, "n_beats": int(len(rpeaks)),
+            "LF": LF, "LF/HF": LFHF, "pLF": pLF, "pHF": pHF,
+            "CSI": CSI,
+            "ModCSI": ModCSI, # <-- Esta columna contendrá NaN
+            "Tachogram_Slope": Tachogram_Slope,
+            "median_rr": median_rr, "mode_rr": mode_rr, "geom_mean_rr": geom_mean_rr, "harm_mean_rr": harm_mean_rr,
+            "std_dev_rr": std_dev_rr, "variance_rr": variance_rr, "abs_dev_rr": abs_dev_rr, "iqr_rr": iqr_rr,
+            "p25_rr": p25_rr, "p75_rr": p75_rr, "kurtosis_rr": kurtosis_rr, "skewness_rr": skewness_rr
+        })
+
+    df = pd.DataFrame(rows).sort_values("start_s").reset_index(drop=True)
+    
+    # ... (el resto de la función es igual) ...
+    df["RAW_t"]= pd.Series([None]*len(df), dtype=object)
+    df["RAW_ecg"] = pd.Series([None]*len(df), dtype=object)
+
+    if len(df) > 0:
+        df.at[0, "RAW_t"]= t_ds
+        df.at[0, "RAW_ecg"] = x_ds
+    
+    df.attrs["onset_abs"]  = onset_abs
+    df.attrs["offset_abs"] = offset_abs
+    df.attrs["fs"]         = fs
+    df.attrs["npz_path"]   = npz_path
+    df.attrs["json_path"]  = json_path
+    df.attrs["sub"] = datos[2][0]
+    df.attrs["ses"] = datos[2][1]
+    df.attrs["run"] = datos[2][2]
     df.attrs["seg"] = datos[2][3] 
 
     return df
@@ -442,7 +863,7 @@ def viewer_plotly_params_from_df(
 import pandas as pd
 import numpy as np
 
-def calcular_baseline_y_alertas(df, baseline_duration_sec=1800, persistence_sec=60, min_votes=4):
+'''def calcular_baseline_y_alertas(df, baseline_duration_sec=1800, persistence_sec=60, min_votes=4):
     """
     Calcula la línea de base, aplica los 6 criterios de alerta y filtra por:
     1. Criterio de Consenso (3 o más alertas individuales activas).
@@ -554,4 +975,189 @@ def calcular_baseline_y_alertas(df, baseline_duration_sec=1800, persistence_sec=
     # Eliminar la columna auxiliar de conteo si no se necesita
     df.drop(columns=['Contador_Alertas'], inplace=True, errors='ignore')
     
+    return df'''
+
+'''def calcular_baseline_y_alertas(df, window_rolling=300, persistence_sec=5, min_votes=2):
+    """
+    Calcula alertas usando un BASELINE DINÁMICO (Rolling Window) con resolución de 1s.
+    Para cada ventana (cada segundo), se compara contra el promedio/std de las 'window_rolling' ventanas ANTERIORES.
+    
+    Params:
+        window_rolling (int): Cantidad de ventanas previas (segundos) a usar como baseline (ej. 300 = 5 mins).
+        persistence_sec (float): Segundos mínimos que debe durar la alerta para ser persistente.
+        min_votes (int): Mínimo de criterios individuales para activar el consenso.
+    """
+    if df.empty:
+        print("El DataFrame está vacío. No se puede calcular el baseline.")
+        return df
+
+    # Asegurar que está ordenado por tiempo para que el rolling funcione bien
+    df = df.sort_values('start_s').reset_index(drop=True)
+
+    # 1. INICIALIZAR COLUMNAS DE ALERTA
+    for col in ['ALERTA_HR_2SD', 'ALERTA_HR_REL_20PCT', 'ALERTA_SDNN_REL_DROP', 
+                'ALERTA_RMSSD_REL_DROP', 'ALERTA_LFHF_REL_RISE', 'ALERTA_SAMPEN_REL_DROP',
+                'ALERTA_CONSENSO', 'ALERTA_PERSISTENTE']:
+        df[col] = False
+
+    # 2. CALCULAR BASELINES DINÁMICOS (Rolling mean & std)
+    # Usamos .shift(1) para que la ventana actual NO se incluya en su propio baseline
+    # min_periods=60 (1 minuto) permite empezar a calcular alertas tras 1 minuto de datos.
+    
+    metrics = ['HR_mean', 'SDNN_ms', 'RMSSD_ms', 'LF/HF', 'SampEn']
+    
+    # Pre-calculamos todos los baselines rodantes vectorizadamente
+    rolling_means = df[metrics].rolling(window=window_rolling, min_periods=60).mean().shift(1)
+    rolling_stds  = df[metrics].rolling(window=window_rolling, min_periods=60).std().shift(1)
+    
+    # Rellenar los primeros NaNs (al inicio) con el primer valor válido que aparezca
+    rolling_means = rolling_means.bfill()
+    rolling_stds = rolling_stds.bfill()
+
+    # 3. APLICAR LÓGICA DE ALERTA (Vectorizado)
+    
+    # --- Criterios HR ---
+    df['ALERTA_HR_2SD'] = df['HR_mean'] > (rolling_means['HR_mean'] + 2 * rolling_stds['HR_mean'])
+    df['ALERTA_HR_REL_20PCT'] = df['HR_mean'] > (rolling_means['HR_mean'] * 1.20)
+
+    # --- Criterios Variabilidad (Caídas) ---
+    if 'SDNN_ms' in df.columns:
+        df['ALERTA_SDNN_REL_DROP'] = df['SDNN_ms'] < (rolling_means['SDNN_ms'] * 0.80)
+    if 'RMSSD_ms' in df.columns:
+        df['ALERTA_RMSSD_REL_DROP'] = df['RMSSD_ms'] < (rolling_means['RMSSD_ms'] * 0.70)
+
+    # --- Criterios Frecuencia y Complejidad ---
+    if 'LF/HF' in df.columns:
+        df['ALERTA_LFHF_REL_RISE'] = df['LF/HF'] > (rolling_means['LF/HF'] * 1.40)
+    if 'SampEn' in df.columns:
+        df['ALERTA_SAMPEN_REL_DROP'] = df['SampEn'] < (rolling_means['SampEn'] * 0.80)
+
+    # 4. CRITERIO DE CONSENSO
+    individual_alerts = ['ALERTA_HR_2SD', 'ALERTA_HR_REL_20PCT', 'ALERTA_SDNN_REL_DROP', 
+                         'ALERTA_RMSSD_REL_DROP', 'ALERTA_LFHF_REL_RISE', 'ALERTA_SAMPEN_REL_DROP']
+    
+    # Rellenar NaNs en columnas de alerta con False para que la suma funcione
+    df[individual_alerts] = df[individual_alerts].fillna(False)
+    
+    df['Contador_Alertas'] = df[individual_alerts].sum(axis=1)
+    df['ALERTA_CONSENSO'] = (df['Contador_Alertas'] >= min_votes)
+
+    # 5. CRITERIO DE PERSISTENCIA TEMPORAL (>= 5 segundos)
+    # Estimar paso real entre ventanas (debería ser 1s)
+    step_sec = df['start_s'].diff().median()
+    if pd.isna(step_sec) or step_sec <= 0:
+         step_sec = 1.0 # Valor default si falla
+
+    # Si step_sec=1 y persistence_sec=5, windows_needed = ceil(5 / 1) = 5 ventanas.
+    windows_needed = max(1, int(np.ceil(persistence_sec / step_sec)))
+    
+    # Rolling sum para verificar si se mantiene activa durante 'windows_needed'
+    # min_periods=windows_needed asegura que solo se marque True al final de la secuencia de 5s
+    rolling_sum = df['ALERTA_CONSENSO'].rolling(window=windows_needed, min_periods=windows_needed).sum()
+    df['ALERTA_PERSISTENTE'] = (rolling_sum == windows_needed)
+    
+    print(f"--- Parámetros Alerta Dinámica ---")
+    print(f"Baseline: Rolling de últimas {window_rolling} ventanas (aprox {window_rolling*step_sec:.0f}s)")
+    print(f"Consenso: {min_votes}/6 criterios.")
+    print(f"Persistencia: {persistence_sec}s (requiere {windows_needed} ventanas consecutivas con step~{step_sec:.1f}s).")
+
+    df.drop(columns=['Contador_Alertas'], inplace=True, errors='ignore')
+    return df'''
+
+def calcular_baseline_y_alertas(df, window_rolling=300, persistence_sec=5, min_votes=4):
+    """
+    Calcula alertas usando un BASELINE DINÁMICO (Rolling Window)
+    y AÑADE métricas combinadas (CSI * Slope).
+    
+    LÓGICA: Usa CSI_Slope como un segundo filtro (filtro AND) 
+    para reducir falsos positivos.
+    """
+    if df.empty:
+        print("El DataFrame está vacío. No se puede calcular el baseline.")
+        return df
+
+    # Asegurar que está ordenado por tiempo para que el rolling funcione bien
+    df = df.sort_values('start_s').reset_index(drop=True)
+
+    # 1. INICIALIZAR COLUMNAS DE ALERTA
+    for col in ['ALERTA_HR_2SD', 'ALERTA_HR_REL_20PCT', 'ALERTA_SDNN_REL_DROP', 
+                'ALERTA_RMSSD_REL_DROP', 'ALERTA_LFHF_REL_RISE', 'ALERTA_SAMPEN_REL_DROP',
+                'ALERTA_CONSENSO', 'ALERTA_PERSISTENTE']:
+        df[col] = False
+
+    # 1.5. CALCULAR MÉTRICAS COMBINADAS
+    if 'CSI' in df.columns and 'Tachogram_Slope' in df.columns:
+        df['CSI_Slope'] = df['CSI'] * df['Tachogram_Slope']
+    else:
+        df['CSI_Slope'] = np.nan
+        
+    # (Cálculo de ModCSI_Slope eliminado)
+
+    # 2. CALCULAR BASELINES DINÁMICOS
+    
+    metrics = ['HR_mean', 'SDNN_ms', 'RMSSD_ms', 'LF/HF', 'SampEn', 'CSI_Slope']
+    metrics = [m for m in metrics if m in df.columns]
+    
+    rolling_means = df[metrics].rolling(window=window_rolling, min_periods=60).mean().shift(1)
+    rolling_stds  = df[metrics].rolling(window=window_rolling, min_periods=60).std().shift(1)
+    
+    rolling_means = rolling_means.bfill()
+    rolling_stds = rolling_stds.bfill()
+
+    # 3. APLICAR LÓGICA DE ALERTA (Vectorizado)
+    
+    # --- Alertas Originales ---
+    df['ALERTA_HR_2SD'] = df['HR_mean'] > (rolling_means['HR_mean'] + 2 * rolling_stds['HR_mean'])
+    df['ALERTA_HR_REL_20PCT'] = df['HR_mean'] > (rolling_means['HR_mean'] * 1.20)
+    if 'SDNN_ms' in df.columns:
+        df['ALERTA_SDNN_REL_DROP'] = df['SDNN_ms'] < (rolling_means['SDNN_ms'] * 0.80)
+    if 'RMSSD_ms' in df.columns:
+        df['ALERTA_RMSSD_REL_DROP'] = df['RMSSD_ms'] < (rolling_means['RMSSD_ms'] * 0.70)
+    if 'LF/HF' in df.columns:
+        df['ALERTA_LFHF_REL_RISE'] = df['LF/HF'] > (rolling_means['LF/HF'] * 1.40)
+    if 'SampEn' in df.columns:
+        df['ALERTA_SAMPEN_REL_DROP'] = df['SampEn'] < (rolling_means['SampEn'] * 0.80)
+
+    # --- NUEVA ALERTA: Filtro CSI_Slope (pico de +2 Desv. Estándar) ---
+    if 'CSI_Slope' in metrics:
+        df['ALERTA_CSI_SLOPE_RISE'] = df['CSI_Slope'] > (rolling_means['CSI_Slope'] + 2 * rolling_stds['CSI_Slope'])
+        df['ALERTA_CSI_SLOPE_RISE'] = df['ALERTA_CSI_SLOPE_RISE'].fillna(False)
+    else:
+        df['ALERTA_CSI_SLOPE_RISE'] = False
+
+    # 4. CRITERIO DE CONSENSO
+    
+    # 4a. Consenso Original (Votación)
+    individual_alerts = ['ALERTA_HR_2SD', 'ALERTA_HR_REL_20PCT', 'ALERTA_SDNN_REL_DROP', 
+                         'ALERTA_RMSSD_REL_DROP', 'ALERTA_LFHF_REL_RISE', 'ALERTA_SAMPEN_REL_DROP']
+    df[individual_alerts] = df[individual_alerts].fillna(False)
+    df['Contador_Alertas'] = df[individual_alerts].sum(axis=1)
+    # Guardamos esta columna para que puedas graficarla
+    df['ALERTA_CONSENSO_ORIGINAL'] = (df['Contador_Alertas'] >= min_votes)
+    
+    # 4b. Consenso Final (Filtro AND)
+    df['ALERTA_CONSENSO'] = df['ALERTA_CONSENSO_ORIGINAL'] & df['ALERTA_CSI_SLOPE_RISE']
+
+
+    # 5. CRITERIO DE PERSISTENCIA TEMPORAL
+    step_sec = df['start_s'].diff().median()
+    if pd.isna(step_sec) or step_sec <= 0:
+         step_sec = 5.0 # Ajustado al step=5 por defecto
+
+    # --- CORRECCIÓN DEL TYPO ---
+    # La variable se llama 'windows_needed' (con 's')
+    windows_needed = max(1, int(np.ceil(persistence_sec / step_sec)))
+    
+    # Aquí se usaba 'window_needed' (sin 's') incorrectamente
+    rolling_sum = df['ALERTA_CONSENSO'].rolling(window=windows_needed, min_periods=windows_needed).sum()
+    df['ALERTA_PERSISTENTE'] = (rolling_sum == windows_needed)
+    # --- FIN DE LA CORRECCIÓN ---
+    
+    print(f"--- Parámetros Alerta Dinámica ---")
+    print(f"Baseline: Rolling de últimas {window_rolling} ventanas (aprox {window_rolling*step_sec:.0f}s)")
+    print(f"Consenso Original: {min_votes}/6 criterios.")
+    print(f"Consenso Final: (Consenso Original) Y (Pico en CSI_Slope)")
+    print(f"Persistencia: {persistence_sec}s (requiere {windows_needed} ventanas consecutivas con step~{step_sec:.1f}s).")
+
+    df.drop(columns=['Contador_Alertas'], inplace=True, errors='ignore')
     return df
